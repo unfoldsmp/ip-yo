@@ -1,0 +1,219 @@
+// =====================================================
+// FILE: ipLogger.js
+// DESCRIPTION: Production-ready IP logger - no mercy
+// USAGE: node ipLogger.js
+// =====================================================
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const cluster = require('cluster');
+const crypto = require('crypto');
+require('dotenv').config();
+
+// ---------- CONFIG (tweak or die) ----------
+const PORT = process.env.PORT || 1337;
+const LOG_DIR = process.env.LOG_DIR || './logs';
+const MAX_LOG_SIZE = 1000; // entries per file
+const RATE_LIMIT = 10; // per minute per IP
+const RESET_SECRET = process.env.RESET_SECRET || 's3cr3t';
+
+// ---------- GEOIP (offline) ----------
+let geoip;
+try {
+  geoip = require('geoip-lite');
+} catch (e) {
+  console.warn('[!] geoip-lite not installed. Install with: npm install geoip-lite');
+  geoip = null;
+}
+
+// ---------- UTILITY FUNCTIONS ----------
+function getTimestamp() {
+  return new Date().toISOString();
+}
+
+function getIP(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  const ip = forwarded ? forwarded.split(',')[0].trim() : req.socket.remoteAddress;
+  return ip === '::1' ? '127.0.0.1' : ip; // normalize IPv6 localhost
+}
+
+function parseUA(ua) {
+  if (!ua) return { browser: 'Unknown', os: 'Unknown', device: 'Unknown' };
+  let browser = 'Unknown', os = 'Unknown', device = 'Desktop';
+  // Rebel regex - crude but effective
+  if (/chrome/i.test(ua) && !/edg/i.test(ua)) browser = 'Chrome';
+  else if (/firefox/i.test(ua)) browser = 'Firefox';
+  else if (/safari/i.test(ua) && !/chrome/i.test(ua)) browser = 'Safari';
+  else if (/edg/i.test(ua)) browser = 'Edge';
+  else if (/opr/i.test(ua)) browser = 'Opera';
+  if (/windows/i.test(ua)) os = 'Windows';
+  else if (/mac/i.test(ua)) os = 'macOS';
+  else if (/linux/i.test(ua)) os = 'Linux';
+  else if (/android/i.test(ua)) { os = 'Android'; device = 'Mobile'; }
+  else if (/iphone|ipad/i.test(ua)) { os = 'iOS'; device = 'Mobile'; }
+  if (/bot|crawl|spider/i.test(ua)) device = 'Bot';
+  return { browser, os, device };
+}
+
+function getGeo(ip) {
+  if (!geoip) return { city: 'N/A', region: 'N/A', country: 'N/A', ll: [0,0] };
+  const geo = geoip.lookup(ip);
+  if (!geo) return { city: 'N/A', region: 'N/A', country: 'N/A', ll: [0,0] };
+  return { city: geo.city, region: geo.region, country: geo.country, ll: geo.ll };
+}
+
+// ---------- RATE LIMITER (in-memory, per worker) ----------
+const rateStore = new Map();
+function isRateLimited(ip) {
+  const now = Date.now();
+  const window = 60000; // 1 min
+  if (!rateStore.has(ip)) {
+    rateStore.set(ip, [now]);
+    return false;
+  }
+  const timestamps = rateStore.get(ip).filter(t => now - t < window);
+  if (timestamps.length >= RATE_LIMIT) return true;
+  timestamps.push(now);
+  rateStore.set(ip, timestamps);
+  return false;
+}
+
+// ---------- LOG WRITER (rotating) ----------
+let logCounter = 0;
+let currentLogFile = path.join(LOG_DIR, `log_${getTimestamp().replace(/:/g,'-')}.ndjson`);
+
+function ensureLogDir() {
+  if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+}
+
+function rotateLog() {
+  logCounter = 0;
+  currentLogFile = path.join(LOG_DIR, `log_${getTimestamp().replace(/:/g,'-')}.ndjson`);
+}
+
+function writeLogEntry(entry) {
+  ensureLogDir();
+  const line = JSON.stringify(entry) + '\n';
+  fs.appendFile(currentLogFile, line, 'utf8', (err) => {
+    if (err) {
+      console.error('[!] Write error:', err.message);
+      // Retry after 100ms (rebel's backoff)
+      setTimeout(() => fs.appendFile(currentLogFile, line, 'utf8', () => {}), 100);
+    }
+  });
+  logCounter++;
+  if (logCounter >= MAX_LOG_SIZE) rotateLog();
+}
+
+// ---------- REQUEST HANDLER ----------
+function handleRequest(req, res) {
+  const ip = getIP(req);
+  if (isRateLimited(ip)) {
+    res.writeHead(429, { 'Content-Type': 'text/plain' });
+    res.end('Too many requests - chill, rebel.\n');
+    return;
+  }
+
+  const ua = req.headers['user-agent'] || '';
+  const referer = req.headers['referer'] || req.headers['referrer'] || '';
+  const parsedUA = parseUA(ua);
+  const geo = getGeo(ip);
+  const entry = {
+    timestamp: getTimestamp(),
+    ip: ip,
+    method: req.method,
+    url: req.url,
+    query: req.url.includes('?') ? req.url.split('?')[1] : '',
+    referer: referer,
+    userAgent: ua,
+    browser: parsedUA.browser,
+    os: parsedUA.os,
+    device: parsedUA.device,
+    city: geo.city,
+    region: geo.region,
+    country: geo.country,
+    latitude: geo.ll[0],
+    longitude: geo.ll[1],
+    hash: crypto.createHash('sha256').update(ip + ua).digest('hex').slice(0,8) // pseudo-ID
+  };
+
+  // ---- ROUTES ----
+  if (req.url === '/dashboard') {
+    // Show recent logs as HTML table (last 50 entries)
+    let logs = [];
+    try {
+      const files = fs.readdirSync(LOG_DIR).filter(f => f.endsWith('.ndjson')).sort().reverse();
+      if (files.length > 0) {
+        const latest = path.join(LOG_DIR, files[0]);
+        const data = fs.readFileSync(latest, 'utf8').split('\n').filter(Boolean).slice(-50);
+        logs = data.map(line => JSON.parse(line));
+      }
+    } catch (e) { /* ignore */ }
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    let html = `<html><head><meta http-equiv="refresh" content="5"><title>IP Logger Dashboard</title></head><body>
+      <h2>🔥 Recent Hits (${logs.length} shown)</h2><table border="1" cellpadding="4">
+      <tr><th>Time</th><th>IP</th><th>City</th><th>Country</th><th>Browser</th><th>OS</th><th>URL</th></tr>`;
+    logs.reverse().forEach(e => {
+      html += `<tr><td>${e.timestamp}</td><td>${e.ip}</td><td>${e.city}</td><td>${e.country}</td><td>${e.browser}</td><td>${e.os}</td><td>${e.url}</td></tr>`;
+    });
+    html += `</table><p><a href="/reset?key=${RESET_SECRET}">Reset Logs</a></p></body></html>`;
+    res.end(html);
+    return;
+  }
+
+  if (req.url.startsWith('/reset')) {
+    const params = new URLSearchParams(req.url.split('?')[1] || '');
+    if (params.get('key') === RESET_SECRET) {
+      try {
+        fs.readdirSync(LOG_DIR).forEach(f => fs.unlinkSync(path.join(LOG_DIR, f)));
+        rotateLog();
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Logs nuked. You rebel.\n');
+      } catch (e) {
+        res.writeHead(500);
+        res.end('Reset failed: ' + e.message);
+      }
+    } else {
+      res.writeHead(403);
+      res.end('Wrong secret, hacker.\n');
+    }
+    return;
+  }
+
+  // ---- DEFAULT: Log and return pixel or JSON ----
+  writeLogEntry(entry);
+
+  // Respond with a 1x1 GIF pixel (invisible tracking) or JSON for API
+  if (req.headers.accept && req.headers.accept.includes('application/json')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'logged', id: entry.hash }));
+  } else {
+    // 1x1 transparent GIF (base64 encoded)
+    const pixel = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+    res.writeHead(200, { 'Content-Type': 'image/gif', 'Cache-Control': 'no-cache' });
+    res.end(pixel);
+  }
+}
+
+// ---------- SERVER (with cluster support) ----------
+if (cluster.isMaster && process.env.NODE_ENV === 'production') {
+  const numCPUs = os.cpus().length;
+  console.log(`[Master] Spawning ${numCPUs} workers...`);
+  for (let i = 0; i < numCPUs; i++) cluster.fork();
+  cluster.on('exit', (worker) => {
+    console.log(`[Master] Worker ${worker.process.pid} died. Respawning...`);
+    cluster.fork();
+  });
+} else {
+  const server = http.createServer(handleRequest);
+  server.listen(PORT, () => {
+    console.log(`[Worker ${process.pid}] 🚀 IP Logger running on port ${PORT}`);
+    console.log(`[Worker ${process.pid}] Logs stored in ${LOG_DIR}`);
+    console.log(`[Worker ${process.pid}] Dashboard: http://localhost:${PORT}/dashboard`);
+    console.log(`[Worker ${process.pid}] Reset: http://localhost:${PORT}/reset?key=${RESET_SECRET}`);
+  });
+  // Graceful shutdown (rebel's exit)
+  process.on('SIGINT', () => { server.close(() => process.exit(0)); });
+}
